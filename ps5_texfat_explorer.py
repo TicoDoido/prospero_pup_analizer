@@ -12,6 +12,7 @@ ssd0.system / ssd0.system_ex images extracted from a PUP.
 - Uses VolumeFlags.ActiveFat when two FATs are present.
 - Supports FAT-chained and NoFatChain contiguous files/directories.
 - Optional PS5 FTP round-trip for SELF .ebin/.bin/.elf/.sprx -> decrypted ELF using ftpsrv.
+- Bulk extraction isolates every SELF in a fresh FTP session and retries once on failure.
 - English UI with a built-in dark theme.
 """
 
@@ -1372,26 +1373,40 @@ class ExplorerApp(tk.Tk):
         decrypted_count = 0
         already_plain_count = 0
         raw_fallback_count = 0
-        ftp_client: Optional[Ps5FtpRoundTrip] = None
+        ftp_retry_count = 0
+        ftp_enabled = bool(self.ftp_decrypt_var.get())
 
-        if self.ftp_decrypt_var.get():
+        # IMPORTANT FOR BULK EXTRACTION:
+        #
+        # Older versions kept one FTP connection alive for the complete recursive
+        # extraction. If ftpsrv rejected/aborted one SELF transfer, that shared
+        # control session could be left unusable and every later SELF would fail
+        # on the same stale connection.
+        #
+        # V4 only validates the configuration here. Every actual SELF conversion
+        # below gets its OWN fresh connection. This also guarantees ftpsrv starts
+        # each file with its default SELF->ELF state enabled.
+        if ftp_enabled:
+            test_client: Optional[Ps5FtpRoundTrip] = None
             try:
-                ftp_client = self._make_ftp_client()
-                ftp_client.connect()
+                test_client = self._make_ftp_client()
+                test_client.connect()
+                test_client.noop()
             except Exception as e:
                 messagebox.showerror(
                     APP_TITLE,
                     "PS5-assisted extraction is enabled, but the FTP connection failed:\n\n"
                     f"{e}\n\nOpen 'Configure / Test FTP...' and check the IP/port.",
                 )
-                if ftp_client:
-                    ftp_client.close()
                 return
+            finally:
+                if test_client:
+                    test_client.close()
 
         progress_win = tk.Toplevel(self)
         self._style_toplevel(progress_win)
         progress_win.title("Extracting")
-        progress_win.geometry("620x155")
+        progress_win.geometry("680x175")
         progress_win.transient(self)
         progress_win.grab_set()
 
@@ -1410,7 +1425,9 @@ class ExplorerApp(tk.Tk):
         ttk.Button(progress_win, text="Cancel", command=cancel).pack(pady=(0, 8))
 
         def extract_one(entry: FsEntry, parent_dir: str):
-            nonlocal file_count, decrypted_count, already_plain_count, raw_fallback_count, ftp_client
+            nonlocal file_count, decrypted_count, already_plain_count
+            nonlocal raw_fallback_count, ftp_retry_count
+
             if cancelled["value"]:
                 return
 
@@ -1440,8 +1457,10 @@ class ExplorerApp(tk.Tk):
                     bar["value"] = done * 100.0 / total
                 progress_win.update_idletasks()
 
+            # We only need a temporary raw file for extensions that *might* be a
+            # SELF. Magic is checked locally before opening a PS5 FTP connection.
             use_ftp_candidate = (
-                ftp_client is not None and Path(entry.name).suffix.lower() in SELF_EXTENSIONS
+                ftp_enabled and Path(entry.name).suffix.lower() in SELF_EXTENSIONS
             )
 
             raw_path = target
@@ -1461,6 +1480,7 @@ class ExplorerApp(tk.Tk):
                     return
 
                 magic = self._local_file_magic(raw_path)
+
                 if magic == ELF_MAGIC:
                     # Some files may already be plaintext in the image.
                     os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
@@ -1472,6 +1492,8 @@ class ExplorerApp(tk.Tk):
 
                 if magic not in (SELF_PS5_MAGIC, SELF_PS4_MAGIC):
                     # Extension looks executable but it is neither SELF nor ELF.
+                    # Preserve it exactly as stored in the image. Crucially, this
+                    # does NOT touch the FTP state for any later file.
                     os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
                     os.replace(raw_path, target)
                     temp_raw = None
@@ -1480,41 +1502,84 @@ class ExplorerApp(tk.Tk):
 
                 label_var.set(f"PS5 SELF→ELF: {entry.path}")
 
-                def ftp_prog(stage: str, done: int, total: int):
-                    if stage == "upload":
-                        detail_var.set(
-                            f"Uploading SELF to {ftp_client.remote_dir} — "
-                            f"{human_size(done)} / {human_size(total)}"
-                        )
-                    else:
-                        detail_var.set(
-                            f"Downloading decrypted ELF — {human_size(done)}"
-                            + (f" / {human_size(total)}" if total else "")
-                        )
-                    if total:
-                        bar["value"] = done * 100.0 / total
-                    else:
-                        bar["value"] = 0
-                    progress_win.update_idletasks()
+                last_error: Optional[Exception] = None
+                converted = False
 
-                try:
-                    ftp_client.roundtrip_self(raw_path, target, entry.name, ftp_prog)
+                # One fresh connection per SELF. Retry once with another completely
+                # new connection if the first transfer/decryption fails.
+                for attempt in (1, 2):
+                    if cancelled["value"]:
+                        return
+
+                    client: Optional[Ps5FtpRoundTrip] = None
+                    try:
+                        client = self._make_ftp_client()
+                        detail_var.set(
+                            f"Opening fresh FTP session for SELF "
+                            f"(attempt {attempt}/2)..."
+                        )
+                        progress_win.update_idletasks()
+                        client.connect()
+
+                        def ftp_prog(stage: str, done: int, total: int):
+                            if stage == "upload":
+                                detail_var.set(
+                                    f"Attempt {attempt}/2 — Uploading SELF to "
+                                    f"{client.remote_dir} — "
+                                    f"{human_size(done)} / {human_size(total)}"
+                                )
+                            else:
+                                detail_var.set(
+                                    f"Attempt {attempt}/2 — Downloading decrypted ELF — "
+                                    f"{human_size(done)}"
+                                    + (f" / {human_size(total)}" if total else "")
+                                )
+                            if total:
+                                bar["value"] = done * 100.0 / total
+                            else:
+                                bar["value"] = 0
+                            progress_win.update_idletasks()
+
+                        client.roundtrip_self(raw_path, target, entry.name, ftp_prog)
+                        converted = True
+                        if attempt == 2:
+                            ftp_retry_count += 1
+                        break
+
+                    except Exception as e:
+                        last_error = e
+                        if attempt == 1:
+                            detail_var.set(
+                                "First SELF→ELF attempt failed; retrying with a "
+                                "brand-new FTP connection..."
+                            )
+                            progress_win.update_idletasks()
+                    finally:
+                        if client:
+                            client.close()
+
+                if converted:
                     decrypted_count += 1
                     file_count += 1
-                except Exception as e:
-                    # Preserve the original encrypted SELF if requested. Never
-                    # silently call it a decrypted ELF.
-                    if self.ftp_keep_raw_on_error_var.get():
-                        fallback = target + ".self"
-                        os.makedirs(os.path.dirname(fallback) or ".", exist_ok=True)
-                        os.replace(raw_path, fallback)
-                        temp_raw = None
-                        raw_fallback_count += 1
-                        errors.append(
-                            f"{entry.path}: SELF→ELF failed ({e}); raw SELF saved as {fallback}"
-                        )
-                    else:
-                        errors.append(f"{entry.path}: SELF→ELF failed: {e}")
+                    return
+
+                # Both isolated attempts failed. Preserve only THIS file as raw;
+                # the next SELF will still get its own clean FTP connection.
+                if self.ftp_keep_raw_on_error_var.get():
+                    fallback = target + ".self"
+                    os.makedirs(os.path.dirname(fallback) or ".", exist_ok=True)
+                    os.replace(raw_path, fallback)
+                    temp_raw = None
+                    raw_fallback_count += 1
+                    file_count += 1
+                    errors.append(
+                        f"{entry.path}: SELF→ELF failed twice "
+                        f"({last_error}); raw SELF saved as {fallback}"
+                    )
+                else:
+                    errors.append(
+                        f"{entry.path}: SELF→ELF failed twice: {last_error}"
+                    )
 
             except Exception as e:
                 errors.append(f"{entry.path}: {e}")
@@ -1532,8 +1597,6 @@ class ExplorerApp(tk.Tk):
                 if cancelled["value"]:
                     break
         finally:
-            if ftp_client:
-                ftp_client.close()
             try:
                 progress_win.grab_release()
                 progress_win.destroy()
@@ -1545,8 +1608,10 @@ class ExplorerApp(tk.Tk):
             f"SELF→ELF via PS5: {decrypted_count}\n"
             f"Already plain ELF: {already_plain_count}"
         )
+        if ftp_retry_count:
+            summary += f"\nSELF→ELF succeeded on retry: {ftp_retry_count}"
         if raw_fallback_count:
-            summary += f"\nRaw SELF preserved after failure: {raw_fallback_count}"
+            summary += f"\nRaw SELF preserved after two failures: {raw_fallback_count}"
 
         if cancelled["value"]:
             messagebox.showwarning(APP_TITLE, f"Extraction cancelled.\n\n{summary}")
@@ -1560,6 +1625,7 @@ class ExplorerApp(tk.Tk):
             )
         else:
             messagebox.showinfo(APP_TITLE, f"Extraction completed.\n\n{summary}")
+
 
     def show_image_info(self):
         if not self.image:
@@ -1588,7 +1654,7 @@ class ExplorerApp(tk.Tk):
             f"Backup boot: {'present' if img.backup_boot_valid else 'missing/invalid'}\n"
             f"Backup checksum: {'VALID' if img.backup_checksum_valid else 'INVALID'}\n"
             f"Main/Backup critical fields: {'match' if img.backup_matches_main else 'differ'}\n\n"
-            f"Version: Dark FTP v3\n"
+            f"Version: Dark FTP v4\n"
             f"Mode: READ ONLY"
         )
         messagebox.showinfo("Image information", text)
