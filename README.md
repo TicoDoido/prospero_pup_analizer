@@ -60,3 +60,5 @@ Notes
 After that, you can use ps5_texfat_explorer.py to extract the .IMG files,  
 since they are simply partitions in exFAT format. Install Python required 
 Optional PS5 FTP round-trip for SELF .ebin/.bin/.elf/.sprx -> decrypted ELF using ftpsrv.  
+
+![Tela principal](screenshots/exemple.png)
