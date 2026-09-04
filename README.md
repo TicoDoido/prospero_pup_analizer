@@ -4,6 +4,8 @@ PS5 PUP FULL ANALIZER
 Purpose  
 -------  
 Non-destructive research payload that reconstructs all block-based PUP data  
+The PUP must be the same as your firware or higher...  
+Does not acept lower firmware pups...  
 
 It never opens /dev/ssd0, /dev/ssd0.system, or /dev/ssd0.system_ex and never  
 formats, mounts, partitions, or writes internal storage.  All output is USB only.  
